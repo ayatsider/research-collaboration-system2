@@ -47,6 +47,7 @@ async function mainMenu() {
 5. Show Projects
 6. Show Collaborations (Neo4j)
 7. Show Researcher Profile (Redis Cache)
+8. Filter Projects 🔍
 0. Exit
 `);
     const choice = await ask("Choose: ");
@@ -58,6 +59,7 @@ async function mainMenu() {
       case "5": await showProjects(); break;
       case "6": await showCollaborations(); break;
       case "7": await showResearcherProfile(); break;
+      case "8": await filterProjects(); break;
       case "0": await shutdown(); return;
       default: console.log("Invalid choice ❌");
     }
@@ -110,7 +112,7 @@ async function addProject() {
       `,
       { name: r.name, title }
     );
-    await redis.del(`profile:${r._id}`); // invalidate cache
+    await redis.del(`profile:${r._id}`);
   }
 
   const addPubs = await ask("Add publications for this project? (y/n): ");
@@ -161,7 +163,7 @@ async function addPublication() {
       `,
       { name: r.name, title, year }
     );
-    await redis.del(`profile:${r._id}`); // invalidate cache
+    await redis.del(`profile:${r._id}`);
   }
 
   console.log("Publication added ✅");
@@ -195,7 +197,7 @@ async function showCollaborations() {
   );
 }
 
-/* ===== Redis Cached Profile (Final) ===== */
+/* ===== Redis Cached Profile ===== */
 async function showResearcherProfile() {
   const researchers = await Researcher.find();
   researchers.forEach((r, i) => console.log(`${i + 1}. ${r.name}`));
@@ -205,7 +207,6 @@ async function showResearcherProfile() {
 
   const key = `profile:${r._id}`;
 
-  // محاولة جلب من Redis
   console.time("FETCH_REDIS");
   const cached = await redis.get(key);
   if (cached) {
@@ -216,23 +217,13 @@ async function showResearcherProfile() {
   }
   console.timeEnd("FETCH_REDIS");
 
-  // جلب البيانات من MongoDB و Neo4j
   console.time("FETCH_DB");
-
-  // الببليكيشنات
   const publications = await Publication.find({ authors: r._id }).lean();
-
-  // المشاريع
-  const projects = await Project.find({ participants: r._id })
-    .populate("publications")
-    .lean();
-
-  // التعاونات من Neo4j
+  const projects = await Project.find({ participants: r._id }).populate("publications").lean();
   const neo = await neoSession.run(
     "MATCH (res:Researcher {name:$name})-[rel]->(n) RETURN type(rel) AS relation, n.title AS target",
     { name: r.name }
   );
-
   console.timeEnd("FETCH_DB");
 
   const profile = {
@@ -249,11 +240,61 @@ async function showResearcherProfile() {
     collaborations: neo.records.map(x => ({ relation: x.get("relation"), target: x.get("target") }))
   };
 
-  // حفظ الكاش لمدة 60 ثانية
   await redis.setEx(key, 60, JSON.stringify(profile));
 
   console.log("🐢 From DBs");
   console.log(profile);
+}
+
+/* ===== Filter Projects 🔍 ===== */
+async function filterProjects() {
+  console.log(`
+Filter Projects by:
+1. Year
+2. Researcher
+3. Interest / Field
+0. Back
+  `);
+
+  const filterChoice = await ask("Choose filter: ");
+  let projects = [];
+
+  switch (filterChoice) {
+    case "1": // By Year
+      const year = Number(await ask("Enter year: "));
+      projects = await Project.find().populate("participants").populate("publications");
+      projects = projects.filter(p => p.publications.some(pub => pub.year === year));
+      break;
+
+    case "2": // By Researcher
+      const researchers = await Researcher.find();
+      researchers.forEach((r, i) => console.log(`${i + 1}. ${r.name}`));
+      const rSel = await ask("Choose researcher: ");
+      const rObj = researchers[rSel - 1];
+      if (!rObj) { console.log("Invalid researcher"); return; }
+      projects = await Project.find({ participants: rObj._id }).populate("participants").populate("publications");
+      break;
+
+    case "3": // By Interest / Field
+      const interest = (await ask("Enter interest/field: ")).toLowerCase();
+      const filteredResearchers = await Researcher.find({ interests: { $in: [interest] } });
+      const ids = filteredResearchers.map(r => r._id);
+      projects = await Project.find({ participants: { $in: ids } }).populate("participants").populate("publications");
+      break;
+
+    case "0": return;
+    default: console.log("Invalid choice"); return;
+  }
+
+  if (!projects.length) { console.log("No projects found ✅"); return; }
+
+  console.log("\nFiltered Projects:");
+  projects.forEach((p, i) => {
+    console.log(`\n${i + 1}. ${p.title} | ${p.description}`);
+    console.log("Participants:", p.participants.map(r => r.name).join(", "));
+    if (p.publications.length)
+      console.log("Publications:", p.publications.map(pub => `${pub.title} (${pub.year})`).join(", "));
+  });
 }
 
 async function shutdown() {
