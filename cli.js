@@ -1,96 +1,83 @@
 import mongoose from "mongoose";
 import dotenv from "dotenv";
 import readline from "readline";
+import neo4j from "neo4j-driver";
+import { createClient } from "redis";
+
 import Researcher from "./models/researcher.model.js";
 import Project from "./models/project.model.js";
 import Publication from "./models/publication.model.js";
-import neo4j from "neo4j-driver";
 
 dotenv.config();
 
-// ================== اتصال MongoDB ==================
-mongoose.connect(process.env.MONGO_URI)
-  .then(() => console.log("MongoDB connected ✅"))
-  .catch(err => console.log("MongoDB connection error:", err));
+/* ================= MongoDB ================= */
+await mongoose.connect(process.env.MONGO_URI);
+console.log("MongoDB connected ✅");
 
-// ================== اتصال Neo4j ==================
+/* ================= Neo4j ================= */
 const driver = neo4j.driver(
   process.env.NEO4J_URI,
   neo4j.auth.basic(process.env.NEO4J_USERNAME, process.env.NEO4J_PASSWORD)
 );
 const neoSession = driver.session({ database: process.env.NEO4J_DATABASE });
+console.log("Neo4j connected ✅");
 
-// ================== واجهة CLI ==================
+/* ================= Redis ================= */
+const redis = createClient({ url: process.env.REDIS_URL });
+redis.on("error", (err) => console.error("Redis Error ❌", err));
+await redis.connect();
+console.log("Redis connected ✅");
+
+/* ================= CLI ================= */
 const rl = readline.createInterface({
   input: process.stdin,
-  output: process.stdout
+  output: process.stdout,
 });
+const ask = (q) => new Promise((res) => rl.question(q, res));
 
-function ask(question) {
-  return new Promise(resolve => rl.question(question, answer => resolve(answer)));
-}
-
-// ================== قائمة رئيسية ==================
+/* ================= Main Menu ================= */
 async function mainMenu() {
   while (true) {
-    console.log("\n===== Research Collaboration CLI =====");
-    console.log("1. Add Researcher");
-    console.log("2. Add Project");
-    console.log("3. Add Publication");
-    console.log("4. Show Researchers");
-    console.log("5. Show Projects");
-    console.log("6. Show Collaborations");
-    console.log("0. Exit");
-
-    const choice = await ask("Enter your choice (number): ");
-
+    console.log(`
+===== Research Collaboration CLI =====
+1. Add Researcher
+2. Add Project
+3. Add Publication
+4. Show Researchers
+5. Show Projects
+6. Show Collaborations (Neo4j)
+7. Show Researcher Profile (Redis Cache)
+0. Exit
+`);
+    const choice = await ask("Choose: ");
     switch (choice) {
-      case "1":
-        await addResearcher();
-        break;
-      case "2":
-        await addProject();
-        break;
-      case "3":
-        await addPublication();
-        break;
-      case "4":
-        await showResearchers();
-        break;
-      case "5":
-        await showProjects();
-        break;
-      case "6":
-        await showCollaborations();
-        break;
-      case "0":
-        console.log("Exiting CLI...");
-        await mongoose.disconnect();
-        await neoSession.close();
-        await driver.close();
-        rl.close();
-        return;
-      default:
-        console.log("Invalid choice. Try again.");
+      case "1": await addResearcher(); break;
+      case "2": await addProject(); break;
+      case "3": await addPublication(); break;
+      case "4": await showResearchers(); break;
+      case "5": await showProjects(); break;
+      case "6": await showCollaborations(); break;
+      case "7": await showResearcherProfile(); break;
+      case "0": await shutdown(); return;
+      default: console.log("Invalid choice ❌");
     }
   }
 }
 
-// ================== دوال CLI ==================
+/* ================= Functions ================= */
 async function addResearcher() {
-  const name = await ask("Researcher Name: ");
+  const name = await ask("Name: ");
   const department = await ask("Department: ");
-  const interests = await ask("Interests (comma separated): ");
-  const r = new Researcher({
+  const interests = await ask("Interests (comma): ");
+
+  const r = await Researcher.create({
     name,
     department,
-    interests: interests.split(",").map(s => s.trim())
+    interests: interests.split(",").map((i) => i.trim()),
   });
-  await r.save();
 
-  // انشاء الباحث في Neo4j
   await neoSession.run(
-    "MERGE (r:Researcher {name: $name, department: $department})",
+    "MERGE (:Researcher {name:$name, department:$department})",
     { name, department }
   );
 
@@ -98,130 +85,185 @@ async function addResearcher() {
 }
 
 async function addProject() {
-  const title = await ask("Project Title: ");
-  const description = await ask("Project Description: ");
+  const title = await ask("Project title: ");
+  const description = await ask("Description: ");
 
   const researchers = await Researcher.find();
-  if (researchers.length === 0) {
-    console.log("No researchers found. Add some first.");
-    return;
-  }
+  if (!researchers.length) { console.log("No researchers found."); return; }
 
-  console.log("Researchers:");
   researchers.forEach((r, i) => console.log(`${i + 1}. ${r.name}`));
-
-  const selected = await ask("Select participants by number (comma separated, or leave empty): ");
-  const participants = selected
-    ? selected.split(",").map(n => researchers[parseInt(n) - 1]?._id).filter(Boolean)
+  const sel = await ask("Participants (numbers, comma or empty): ");
+  const participants = sel
+    ? sel.split(",").map((n) => researchers[n - 1]?._id).filter(Boolean)
     : [];
 
-  // اضف المشاريع والباحثين في MongoDB
-  const p = new Project({ title, description, participants });
-  await p.save();
+  const project = await Project.create({ title, description, participants });
 
-  // اضف روابط الباحثين في Neo4j
-  for (const idx of (selected ? selected.split(",") : [])) {
-    const researcher = researchers[parseInt(idx) - 1];
-    if (!researcher) continue;
-
-    const relation = await ask(`Enter relationship with ${researcher.name} (co-authorship / supervision / teamwork): `);
+  for (const id of participants) {
+    const r = await Researcher.findById(id);
+    const rel = await ask(`Relation with ${r.name} (co-authorship / supervision / teamwork): `);
     await neoSession.run(
       `
-      MATCH (r:Researcher {name: $rName})
-      MERGE (p:Project {title: $title})
-      MERGE (r)-[:${relation.toUpperCase().replace("-", "_")}]->(p)
+      MATCH (r:Researcher {name:$name})
+      MERGE (p:Project {title:$title})
+      MERGE (r)-[:${rel.toUpperCase().replace("-", "_")}]->(p)
       `,
-      { rName: researcher.name, title }
+      { name: r.name, title }
     );
+    await redis.del(`profile:${r._id}`); // invalidate cache
   }
 
-  // اضف النشرات
-  const addPubs = await ask("Do you want to add publications for this project? (y/n): ");
+  const addPubs = await ask("Add publications for this project? (y/n): ");
   if (addPubs.toLowerCase() === "y") {
-    const num = parseInt(await ask("How many publications? "));
+    const num = Number(await ask("How many? "));
     for (let i = 0; i < num; i++) {
       const pubTitle = await ask(`Publication ${i + 1} Title: `);
-      const pubYear = parseInt(await ask("Year: "));
-      const pub = new Publication({ title: pubTitle, year: pubYear, authors: participants });
-      await pub.save();
-      p.publications.push(pub._id);
+      const pubYear = Number(await ask("Year: "));
+      const pub = await Publication.create({ title: pubTitle, year: pubYear, authors: participants });
+      project.publications.push(pub._id);
 
-      // ربط authors بالنشر في Neo4j
       for (const rId of participants) {
-        const researcher = await Researcher.findById(rId);
+        const r = await Researcher.findById(rId);
         await neoSession.run(
           `
-          MATCH (r:Researcher {name: $rName})
-          MERGE (pub:Publication {title: $pubTitle, year: $pubYear})
+          MATCH (r:Researcher {name:$name})
+          MERGE (pub:Publication {title:$pubTitle, year:$pubYear})
           MERGE (r)-[:AUTHOR_OF]->(pub)
           `,
-          { rName: researcher.name, pubTitle, pubYear }
+          { name: r.name, pubTitle, pubYear }
         );
+        await redis.del(`profile:${r._id}`);
       }
     }
-    await p.save();
+    await project.save();
   }
 
   console.log("Project added ✅");
 }
 
 async function addPublication() {
-  const title = await ask("Publication Title: ");
-  const year = parseInt(await ask("Year: "));
+  const title = await ask("Publication title: ");
+  const year = Number(await ask("Year: "));
   const researchers = await Researcher.find();
-  console.log("Researchers:");
   researchers.forEach((r, i) => console.log(`${i + 1}. ${r.name}`));
-  const selected = await ask("Select authors by number (comma separated): ");
-  const authors = selected.split(",").map(n => researchers[parseInt(n)-1]?._id).filter(Boolean);
-  const pub = new Publication({ title, year, authors });
-  await pub.save();
+  const sel = await ask("Authors (numbers, comma): ");
+  const authors = sel.split(",").map((n) => researchers[n - 1]?._id).filter(Boolean);
 
-  // Neo4j
-  for (const rId of authors) {
-    const researcher = await Researcher.findById(rId);
+  const pub = await Publication.create({ title, year, authors });
+
+  for (const id of authors) {
+    const r = await Researcher.findById(id);
     await neoSession.run(
       `
-      MATCH (r:Researcher {name: $rName})
-      MERGE (pub:Publication {title: $title, year: $year})
-      MERGE (r)-[:AUTHOR_OF]->(pub)
+      MATCH (r:Researcher {name:$name})
+      MERGE (p:Publication {title:$title, year:$year})
+      MERGE (r)-[:AUTHOR_OF]->(p)
       `,
-      { rName: researcher.name, title, year }
+      { name: r.name, title, year }
     );
+    await redis.del(`profile:${r._id}`); // invalidate cache
   }
 
   console.log("Publication added ✅");
 }
 
 async function showResearchers() {
-  const researchers = await Researcher.find().populate("publications");
-  researchers.forEach(r => {
-    console.log(`\n${r.name} | ${r.department} | Interests: ${r.interests.join(", ")}`);
-    if (r.publications.length > 0) {
-      console.log("Publications:");
-      r.publications.forEach(p => console.log(` - ${p.title} (${p.year})`));
-    }
-  });
+  const data = await Researcher.find();
+  data.forEach((r) => console.log(`${r.name} | ${r.department}`));
 }
 
 async function showProjects() {
-  const projects = await Project.find().populate("participants").populate("publications");
-  projects.forEach(p => {
+  const data = await Project.find().populate("participants").populate("publications");
+  data.forEach((p) => {
     console.log(`\n${p.title} | ${p.description}`);
-    console.log("Participants:", p.participants.map(r => r.name).join(", "));
-    if (p.publications.length > 0) {
-      console.log("Publications:");
-      p.publications.forEach(pub => console.log(` - ${pub.title} (${pub.year})`));
-    }
+    console.log("Participants:", p.participants.map((r) => r.name).join(", "));
+    if (p.publications.length) console.log("Publications:", p.publications.map((pub) => pub.title).join(", "));
   });
 }
 
 async function showCollaborations() {
-  console.log("Collaborations in Neo4j:");
-  const result = await neoSession.run("MATCH (r:Researcher)-[rel]->(p) RETURN r.name AS researcher, type(rel) AS relation, p.title AS project LIMIT 50");
-  result.records.forEach(rec => {
-    console.log(`${rec.get("researcher")} -[${rec.get("relation")}]-> ${rec.get("project")}`);
-  });
+  const res = await neoSession.run(
+    `
+    MATCH (r:Researcher)
+    OPTIONAL MATCH (r)-[rel]->(n)
+    RETURN r.name AS researcher, type(rel) AS relation, n.title AS target
+    LIMIT 50
+    `
+  );
+  res.records.forEach((r) =>
+    console.log(`${r.get("researcher")} -[${r.get("relation")}]-> ${r.get("target")}`)
+  );
 }
 
-// ================== تشغيل CLI ==================
+/* ===== Redis Cached Profile (Final) ===== */
+async function showResearcherProfile() {
+  const researchers = await Researcher.find();
+  researchers.forEach((r, i) => console.log(`${i + 1}. ${r.name}`));
+  const sel = await ask("Choose researcher: ");
+  const r = researchers[sel - 1];
+  if (!r) return;
+
+  const key = `profile:${r._id}`;
+
+  // محاولة جلب من Redis
+  console.time("FETCH_REDIS");
+  const cached = await redis.get(key);
+  if (cached) {
+    console.log("⚡ From Redis");
+    console.timeEnd("FETCH_REDIS");
+    console.log(JSON.parse(cached));
+    return;
+  }
+  console.timeEnd("FETCH_REDIS");
+
+  // جلب البيانات من MongoDB و Neo4j
+  console.time("FETCH_DB");
+
+  // الببليكيشنات
+  const publications = await Publication.find({ authors: r._id }).lean();
+
+  // المشاريع
+  const projects = await Project.find({ participants: r._id })
+    .populate("publications")
+    .lean();
+
+  // التعاونات من Neo4j
+  const neo = await neoSession.run(
+    "MATCH (res:Researcher {name:$name})-[rel]->(n) RETURN type(rel) AS relation, n.title AS target",
+    { name: r.name }
+  );
+
+  console.timeEnd("FETCH_DB");
+
+  const profile = {
+    _id: r._id,
+    name: r.name,
+    department: r.department,
+    interests: r.interests,
+    projects: projects.map(p => ({
+      title: p.title,
+      description: p.description,
+      publications: p.publications.map(pub => ({ title: pub.title, year: pub.year }))
+    })),
+    publications: publications.map(p => ({ title: p.title, year: p.year })),
+    collaborations: neo.records.map(x => ({ relation: x.get("relation"), target: x.get("target") }))
+  };
+
+  // حفظ الكاش لمدة 60 ثانية
+  await redis.setEx(key, 60, JSON.stringify(profile));
+
+  console.log("🐢 From DBs");
+  console.log(profile);
+}
+
+async function shutdown() {
+  await mongoose.disconnect();
+  await neoSession.close();
+  await driver.close();
+  await redis.disconnect();
+  rl.close();
+  console.log("Bye 👋");
+}
+
+/* ================= Run CLI ================= */
 mainMenu();
